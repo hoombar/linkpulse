@@ -2,6 +2,7 @@
 # Copy this to config.yaml and add your actual URLs
 
 sources:
+  # Individual YouTube videos (manual entry)
   youtube_videos:
     - url: "https://youtube.com/watch?v=abc123"
       title: "How to Build a Gaming PC 2024"  # optional, will fetch if not provided
@@ -9,7 +10,17 @@ sources:
       title: "Best Budget Laptops Under £500"
     - url: "https://youtu.be/ghi789"
       # title will be automatically fetched from YouTube
+  
+  # YouTube channels (bulk discovery - NEW!)
+  youtube_channels:
+    - url: "https://youtube.com/c/TechChannel"
+      # Will discover all videos from this channel (up to max_videos_per_channel)
+    - url: "https://youtube.com/@TechReviewer"
+      # Supports @username format
+    - url: "https://youtube.com/channel/UC1234567890"
+      # Supports direct channel ID format
       
+  # Individual blog posts (manual entry)  
   blog_posts:
     - url: "https://myblog.com/tech-accessories-2024"
       title: "Top 10 Tech Accessories for 2024"  # optional
@@ -17,6 +28,15 @@ sources:
       title: "Best VPN Services Compared"
     - url: "https://example.com/affiliate-post"
       # title will be automatically fetched from page
+  
+  # Website domains (bulk discovery - NEW!)
+  website_domains:
+    - url: "https://techblog.com"
+      # Will discover blog posts from sitemap, RSS feeds, and crawling
+    - domain: "gadgetreviews.net" 
+      # Can use 'domain' instead of 'url' (will add https://)
+    - url: "https://affiliate-site.com/blog"
+      # Can target specific subdirectories
 
 settings:
   concurrent_requests: 3        # Max simultaneous link checks
@@ -25,8 +45,20 @@ settings:
   delay_between_requests: 1.5  # Delay between requests (rate limiting)
   youtube_api_key: null        # Optional - YouTube API key for better extraction
   
+  # Bulk discovery settings (NEW!)
+  max_videos_per_channel: 50   # Max videos to discover per YouTube channel
+  max_posts_per_domain: 100    # Max blog posts to discover per website domain
+  crawl_depth: 2               # How deep to crawl websites (1-3 recommended)
+  days_back: 180               # Only consider content from last N days (not implemented yet)
+  
+# Usage:
+# Basic mode: python linkpulse.py --config config.yaml
+# With discovery: python linkpulse.py --config config.yaml --discover
+# Discovery only: python linkpulse.py --config config.yaml --discover-only
+
 # Notes:
 # - youtube_api_key: Get from Google Cloud Console, YouTube Data API v3
 # - If no API key provided, will fall back to web scraping (slower but works)
 # - Supported affiliate platforms: Amazon UK, AliExpress
 # - Links are automatically detected from video descriptions and blog content
+# - Discovery methods: YouTube API/scraping, website sitemaps, RSS feeds, crawling
