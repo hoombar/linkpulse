@@ -1,0 +1,32 @@
+# LinkPulse Configuration Example
+# Copy this to config.yaml and add your actual URLs
+
+sources:
+  youtube_videos:
+    - url: "https://youtube.com/watch?v=abc123"
+      title: "How to Build a Gaming PC 2024"  # optional, will fetch if not provided
+    - url: "https://youtube.com/watch?v=def456" 
+      title: "Best Budget Laptops Under £500"
+    - url: "https://youtu.be/ghi789"
+      # title will be automatically fetched from YouTube
+      
+  blog_posts:
+    - url: "https://myblog.com/tech-accessories-2024"
+      title: "Top 10 Tech Accessories for 2024"  # optional
+    - url: "https://myblog.com/vpn-comparison"
+      title: "Best VPN Services Compared"
+    - url: "https://example.com/affiliate-post"
+      # title will be automatically fetched from page
+
+settings:
+  concurrent_requests: 3        # Max simultaneous link checks
+  request_timeout: 30           # Request timeout in seconds  
+  retry_attempts: 3            # Retry attempts for failed requests
+  delay_between_requests: 1.5  # Delay between requests (rate limiting)
+  youtube_api_key: null        # Optional - YouTube API key for better extraction
+  
+# Notes:
+# - youtube_api_key: Get from Google Cloud Console, YouTube Data API v3
+# - If no API key provided, will fall back to web scraping (slower but works)
+# - Supported affiliate platforms: Amazon UK, AliExpress
+# - Links are automatically detected from video descriptions and blog content

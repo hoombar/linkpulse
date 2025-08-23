@@ -1,0 +1,15 @@
+sources:
+  youtube_videos:
+    - url: "https://youtube.com/watch?v=dQw4w9WgXcQ"
+      title: "Test YouTube Video"
+      
+  blog_posts:
+    - url: "https://example.com"
+      title: "Test Blog Post"
+
+settings:
+  concurrent_requests: 2
+  request_timeout: 30
+  retry_attempts: 2
+  delay_between_requests: 1.0
+  youtube_api_key: null
