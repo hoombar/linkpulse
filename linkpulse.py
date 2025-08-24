@@ -56,6 +56,8 @@ class Config:
                 'max_posts_per_domain': settings.get('max_posts_per_domain', 100),
                 'crawl_depth': settings.get('crawl_depth', 2),
                 'days_back': settings.get('days_back', 180),
+                'check_regions': settings.get('check_regions', ['US', 'UK']),
+                'enable_onelink_checking': settings.get('enable_onelink_checking', True),
             }
             
             return config
@@ -620,6 +622,75 @@ class LinkChecker:
             'Upgrade-Insecure-Requests': '1'
         }
     
+    def is_onelink_url(self, url: str) -> bool:
+        """Check if URL is an Amazon OneLink"""
+        onelink_patterns = [
+            r'amzn\.to/',
+            r'amazon\.com/.*tag=.*-20',  # US affiliate links with tag
+            r'amazon\.co\.uk/.*tag=.*-21',  # UK affiliate links with tag
+            r'amazon\.com/dp/.*\?.*tag=',  # Direct product links with tags
+            r'amazon\.co\.uk/dp/.*\?.*tag=',
+        ]
+        
+        for pattern in onelink_patterns:
+            if re.search(pattern, url, re.IGNORECASE):
+                return True
+        return False
+    
+    def extract_amazon_product_id(self, url: str) -> Optional[str]:
+        """Extract Amazon product ID from URL"""
+        patterns = [
+            r'/dp/([A-Z0-9]{10})',
+            r'/gp/product/([A-Z0-9]{10})',
+            r'amazon\.com/.*?/dp/([A-Z0-9]{10})',
+            r'amazon\.co\.uk/.*?/dp/([A-Z0-9]{10})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+    
+    def get_regional_headers(self, region: str) -> dict:
+        """Get headers that simulate requests from different regions"""
+        # Use more realistic user agents for Amazon
+        regional_user_agents = {
+            'US': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'UK': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        base_headers = {
+            'User-Agent': regional_user_agents.get(region, random.choice(self.user_agents)),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        regional_headers = {
+            'US': {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'CloudFront-Viewer-Country': 'US',
+                'CloudFront-Viewer-Currency': 'USD',
+            },
+            'UK': {
+                'Accept-Language': 'en-GB,en;q=0.9',
+                'CloudFront-Viewer-Country': 'GB', 
+                'CloudFront-Viewer-Currency': 'GBP',
+            }
+        }
+        
+        if region in regional_headers:
+            base_headers.update(regional_headers[region])
+        
+        return base_headers
+
     def extract_video_id(self, url: str) -> Optional[str]:
         """Extract YouTube video ID from URL"""
         patterns = [
@@ -825,113 +896,290 @@ class LinkChecker:
                 'error': f'Failed to fetch blog post: {e}'
             }
     
-    def check_amazon_link(self, url: str) -> Dict:
-        """Check Amazon UK link status"""
+    def check_amazon_onelink(self, url: str) -> Dict:
+        """Check Amazon OneLink across multiple regions"""
+        if not self.config.data['settings']['enable_onelink_checking']:
+            # Fall back to regular checking if OneLink checking is disabled
+            return self.check_amazon_link_single_region(url, 'default')
+        
+        regions_to_check = self.config.data['settings']['check_regions']
+        regional_results = {}
+        overall_status = 'working'
+        errors = []
+        
+        # First, try to get the product ID for direct link construction
+        product_id = self.extract_amazon_product_id(url)
+        
+        for region in regions_to_check:
+            try:
+                if self.verbose:
+                    print(f"    🌍 Checking {region} region...")
+                
+                # Method 1: Try with regional headers
+                result = self.check_amazon_link_with_headers(url, region)
+                
+                # Method 2: If that fails and we have a product ID, try direct regional links
+                if result['status'] == 'broken' and product_id:
+                    if self.verbose:
+                        print(f"      ⚠️  {region} failed, trying direct link...")
+                    # Add extra delay before retry
+                    time.sleep(self.config.data['settings']['delay_between_requests'])
+                    direct_url = self.construct_regional_amazon_url(product_id, region)
+                    if direct_url:
+                        result = self.check_amazon_link_single_region(direct_url, region)
+                        result['direct_link_used'] = True
+                        result['direct_url'] = direct_url
+                
+                regional_results[region] = result
+                
+                # Track overall status
+                if result['status'] == 'broken':
+                    overall_status = 'partial'  # Works in some regions but not others
+                    errors.append(f"{region}: {result.get('error', 'Unknown error')}")
+                
+            except Exception as e:
+                regional_results[region] = {
+                    'status': 'broken',
+                    'title': 'Regional Check Failed',
+                    'price': None,
+                    'error': f'Regional check error: {e}'
+                }
+                errors.append(f"{region}: {e}")
+        
+        # If all regions failed, mark as fully broken
+        if all(result['status'] == 'broken' for result in regional_results.values()):
+            overall_status = 'broken'
+        
+        # Get the best title and price from successful regions
+        working_results = [r for r in regional_results.values() if r['status'] == 'working']
+        if working_results:
+            best_result = working_results[0]
+            title = best_result['title']
+            price = best_result['price']
+        else:
+            title = 'Amazon Product (OneLink)'
+            price = None
+        
+        return {
+            'status': overall_status,
+            'title': title,
+            'price': price,
+            'error': '; '.join(errors) if errors else None,
+            'url': url,
+            'platform': 'amazon',
+            'regional_results': regional_results,
+            'is_onelink': True
+        }
+    
+    def check_amazon_link_with_headers(self, url: str, region: str) -> Dict:
+        """Check Amazon link with region-specific headers"""
         try:
-            # Add delay for rate limiting
             time.sleep(self.config.data['settings']['delay_between_requests'])
             
+            headers = self.get_regional_headers(region)
             response = self.session.get(
                 url,
-                headers=self.get_headers(),
+                headers=headers,
                 timeout=self.config.data['settings']['request_timeout'],
                 allow_redirects=True
             )
             
-            # Handle Amazon's 500 errors - if we got redirected to a product page, 
-            # it's likely the link works even if Amazon returns 500
-            if response.status_code == 500 and '/dp/' in response.url:
-                return {
-                    'status': 'working',
-                    'title': 'Amazon Product (500 Error but Valid Product Page)',
-                    'price': 'Price check failed (500 error)',
-                    'error': None
-                }
+            return self.parse_amazon_response(response, region)
             
-            # Handle other HTTP errors
-            if response.status_code != 200:
-                return {
-                    'status': 'broken',
-                    'title': 'Amazon Product',
-                    'price': None,
-                    'error': f'HTTP {response.status_code} error'
-                }
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Check if redirected to search page (product removed)
-            if '/s?' in response.url or 'search' in response.url.lower():
-                return {
-                    'status': 'broken',
-                    'title': 'Product Not Found',
-                    'price': None,
-                    'error': 'Product no longer available (redirects to search page)'
-                }
-            
-            # Extract product title
-            title_selectors = ['#productTitle', 'h1.a-size-large', 'h1 span']
-            title = 'Amazon Product'
-            for selector in title_selectors:
-                title_elem = soup.select_one(selector)
-                if title_elem:
-                    title = title_elem.get_text().strip()
-                    break
-            
-            # Extract price
-            price = None
-            price_selectors = [
-                '.a-price-whole',
-                '.a-offscreen',
-                '.a-price .a-offscreen',
-                '#price_inside_buybox'
-            ]
-            for selector in price_selectors:
-                price_elem = soup.select_one(selector)
-                if price_elem:
-                    price_text = price_elem.get_text().strip()
-                    if '£' in price_text:
-                        price = price_text
-                        break
-            
-            # Check availability
-            availability_indicators = [
-                'Currently unavailable',
-                'Out of stock',
-                'Temporarily out of stock'
-            ]
-            
-            page_text = soup.get_text().lower()
-            for indicator in availability_indicators:
-                if indicator.lower() in page_text:
-                    return {
-                        'status': 'broken',
-                        'title': title,
-                        'price': price,
-                        'error': f'Product {indicator.lower()}'
-                    }
-            
-            # If we got here, assume it's working
+        except Exception as e:
             return {
-                'status': 'working',
-                'title': title,
-                'price': price or 'Price not found',
-                'error': None
+                'status': 'broken',
+                'title': f'Amazon Product ({region})',
+                'price': None,
+                'error': f'Request failed: {e}'
             }
+    
+    def construct_regional_amazon_url(self, product_id: str, region: str) -> Optional[str]:
+        """Construct direct regional Amazon URLs"""
+        regional_domains = {
+            'US': 'amazon.com',
+            'UK': 'amazon.co.uk',
+        }
+        
+        if region not in regional_domains:
+            return None
+            
+        domain = regional_domains[region]
+        return f"https://{domain}/dp/{product_id}"
+    
+    def check_amazon_link_single_region(self, url: str, region: str = 'default') -> Dict:
+        """Check Amazon link for a single region (original functionality)"""
+        try:
+            time.sleep(self.config.data['settings']['delay_between_requests'])
+            
+            headers = self.get_regional_headers(region) if region != 'default' else self.get_headers()
+            response = self.session.get(
+                url,
+                headers=headers,
+                timeout=self.config.data['settings']['request_timeout'],
+                allow_redirects=True
+            )
+            
+            return self.parse_amazon_response(response, region)
             
         except requests.exceptions.RequestException as e:
             return {
                 'status': 'broken',
-                'title': 'Amazon Product',
+                'title': f'Amazon Product ({region})',
                 'price': None,
                 'error': f'Network error: {e}'
             }
         except Exception as e:
             return {
                 'status': 'broken',
-                'title': 'Amazon Product', 
+                'title': f'Amazon Product ({region})',
                 'price': None,
                 'error': f'Check failed: {e}'
             }
+    
+    def parse_amazon_response(self, response, region: str) -> Dict:
+        """Parse Amazon response and extract product information"""
+        # Debug output for problematic links
+        if self.verbose and response.status_code != 200:
+            print(f"        ⚠️  {region} Response: HTTP {response.status_code}, URL: {response.url[:80]}...")
+        
+        # Handle Amazon's 500 errors - if we got redirected to a product page, 
+        # it's likely the link works even if Amazon returns 500
+        if response.status_code == 500 and '/dp/' in response.url:
+            return {
+                'status': 'working',
+                'title': f'Amazon Product ({region} - 500 Error but Valid)',
+                'price': 'Price check failed (500 error)',
+                'error': None
+            }
+        
+        # Amazon sometimes returns 503 (Service Unavailable) for bot detection
+        # If we got redirected to a valid product page, treat as working
+        if response.status_code == 503 and '/dp/' in response.url:
+            return {
+                'status': 'working',
+                'title': f'Amazon Product ({region} - Bot Detection but Valid)',
+                'price': 'Price check limited by bot detection',
+                'error': None
+            }
+        
+        # Handle other HTTP errors
+        if response.status_code != 200:
+            return {
+                'status': 'broken',
+                'title': f'Amazon Product ({region})',
+                'price': None,
+                'error': f'HTTP {response.status_code} error'
+            }
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Check if redirected to search page (product removed)
+        if '/s?' in response.url or 'search' in response.url.lower():
+            return {
+                'status': 'broken',
+                'title': f'Product Not Found ({region})',
+                'price': None,
+                'error': f'Product no longer available in {region} (redirects to search page)'
+            }
+        
+        # If we got to a valid product page (/dp/ in URL), but got blocked content,
+        # treat as working link with limited access
+        if '/dp/' in response.url:
+            page_text = soup.get_text().lower()
+            
+            # Check for bot detection indicators
+            bot_indicators = [
+                'robot check',
+                'unusual traffic',
+                'automated requests',
+                'verify you are human',
+                'captcha',
+                'something went wrong',
+                'sorry, we just need to make sure you',
+                'enter the characters you see below'
+            ]
+            
+            for indicator in bot_indicators:
+                if indicator in page_text:
+                    return {
+                        'status': 'working',
+                        'title': f'Amazon Product ({region} - Bot Detection)',
+                        'price': 'Link works but price blocked by bot detection',
+                        'error': None
+                    }
+            
+            # If content seems minimal or blocked but we're on a product page,
+            # it's likely bot detection rather than a broken link
+            if len(page_text) < 500:  # Very short page content suggests blocking
+                return {
+                    'status': 'working',
+                    'title': f'Amazon Product ({region} - Limited Access)',
+                    'price': 'Link works but content limited',
+                    'error': None
+                }
+        
+        # Extract product title
+        title_selectors = ['#productTitle', 'h1.a-size-large', 'h1 span']
+        title = f'Amazon Product ({region})'
+        for selector in title_selectors:
+            title_elem = soup.select_one(selector)
+            if title_elem:
+                title = title_elem.get_text().strip()
+                break
+        
+        # Extract price with regional currency detection
+        price = None
+        price_selectors = [
+            '.a-price-whole',
+            '.a-offscreen',
+            '.a-price .a-offscreen',
+            '#price_inside_buybox'
+        ]
+        for selector in price_selectors:
+            price_elem = soup.select_one(selector)
+            if price_elem:
+                price_text = price_elem.get_text().strip()
+                # Look for various currency symbols
+                if any(symbol in price_text for symbol in ['£', '$', '€', '¥']):
+                    price = price_text
+                    break
+        
+        # Check availability
+        availability_indicators = [
+            'Currently unavailable',
+            'Out of stock',
+            'Temporarily out of stock'
+        ]
+        
+        page_text = soup.get_text().lower()
+        for indicator in availability_indicators:
+            if indicator.lower() in page_text:
+                return {
+                    'status': 'broken',
+                    'title': title,
+                    'price': price,
+                    'error': f'Product {indicator.lower()} in {region}'
+                }
+        
+        # If we got here, assume it's working
+        return {
+            'status': 'working',
+            'title': title,
+            'price': price or 'Price not found',
+            'error': None
+        }
+    
+    def check_amazon_link(self, url: str) -> Dict:
+        """Check Amazon link status - detects and handles OneLink URLs"""
+        # Check if this is a OneLink URL that should use multi-region checking
+        if self.is_onelink_url(url):
+            if self.verbose:
+                print(f"      🔗 Detected OneLink, checking multiple regions...")
+            return self.check_amazon_onelink(url)
+        else:
+            # Use single-region checking for non-OneLink URLs
+            return self.check_amazon_link_single_region(url)
     
     def check_aliexpress_link(self, url: str) -> Dict:
         """Check AliExpress link status"""
@@ -1245,13 +1493,21 @@ class LinkChecker:
                 results.append(result)
                 
                 if self.verbose:
-                    status_icon = "✅" if result['status'] == 'working' else "❌"
+                    status_icon = "✅" if result['status'] == 'working' else "⚠️" if result['status'] == 'partial' else "❌"
                     source_type = "📺" if result['source']['type'] == 'youtube' else "📝"
                     source_title = result['source']['title'][:30]
                     link_url = result['url'][:60]
                     product_title = result['title'][:40]
                     print(f"  {status_icon} {source_type} {source_title} | {product_title}")
                     print(f"      └─ {link_url}")
+                    
+                    # Show regional information for OneLink URLs
+                    if result.get('is_onelink') and result.get('regional_results'):
+                        for region, regional_result in result['regional_results'].items():
+                            region_icon = "✅" if regional_result['status'] == 'working' else "❌"
+                            print(f"        🌍 {region}: {region_icon} {regional_result.get('error', 'OK')}")
+                            if regional_result.get('direct_link_used'):
+                                print(f"          └─ Used direct link: {regional_result.get('direct_url', '')[:50]}...")
         
         return results
 
@@ -1307,16 +1563,51 @@ class OutputFormatter:
             return "No affiliate links found in the provided sources."
         
         working_results = [r for r in results if r['status'] == 'working']
+        partial_results = [r for r in results if r['status'] == 'partial']  # OneLink partial results
         broken_results = [r for r in results if r['status'] == 'broken']
         
         output_lines = []
         
         # Header with summary
-        if broken_results:
-            output_lines.append(f"🚨 BROKEN LINKS FOUND ({len(broken_results)} issues)")
+        issues_count = len(broken_results) + len(partial_results)
+        if issues_count > 0:
+            output_lines.append(f"🚨 LINK ISSUES FOUND ({issues_count} issues)")
+            if partial_results:
+                output_lines.append(f"    ⚠️  {len(partial_results)} OneLink URLs work partially (some regions)")
+            if broken_results:
+                output_lines.append(f"    ❌ {len(broken_results)} URLs completely broken")
             output_lines.append("")
         
-        # Show broken links (always shown)
+        # Show partial OneLink results first
+        if partial_results:
+            output_lines.append("⚠️  PARTIAL ONELINK URLS (work in some regions):")
+            
+            # Group by source
+            sources_with_partial = {}
+            for result in partial_results:
+                source_key = (result['source']['type'], result['source']['title'])
+                if source_key not in sources_with_partial:
+                    sources_with_partial[source_key] = []
+                sources_with_partial[source_key].append(result)
+            
+            for (source_type, source_title), source_results in sources_with_partial.items():
+                icon = "📺" if source_type == 'youtube' else "📝"
+                output_lines.append(f"{icon} \"{source_title}\"")
+                
+                for result in source_results:
+                    title = result['title'] if result['title'] != 'Link' else result['original_title']
+                    output_lines.append(f"  ├─ {title} - {result['url']}")
+                    
+                    # Show regional breakdown
+                    if result.get('regional_results'):
+                        for region, regional_result in result['regional_results'].items():
+                            status = "✅ Working" if regional_result['status'] == 'working' else f"❌ {regional_result.get('error', 'Failed')}"
+                            output_lines.append(f"     └─ {region}: {status}")
+                    else:
+                        output_lines.append(f"     └─ ERROR: {result['error']}")
+                output_lines.append("")
+        
+        # Show completely broken links
         if broken_results:
             output_lines.append("❌ BROKEN LINKS:")
             
@@ -1361,10 +1652,16 @@ class OutputFormatter:
                 output_lines.append("")
         
         # Summary
-        if not broken_results:
-            output_lines.append(f"✅ All links are working properly ({len(working_results)} links checked)")
+        total_links = len(working_results) + len(partial_results) + len(broken_results)
+        if not broken_results and not partial_results:
+            output_lines.append(f"✅ All links are working properly ({total_links} links checked)")
         else:
-            output_lines.append(f"📊 SUMMARY: {len(working_results)} working, {len(broken_results)} broken")
+            summary_parts = [f"{len(working_results)} working"]
+            if partial_results:
+                summary_parts.append(f"{len(partial_results)} partial")
+            if broken_results:
+                summary_parts.append(f"{len(broken_results)} broken")
+            output_lines.append(f"📊 SUMMARY: {', '.join(summary_parts)}")
         
         return "\n".join(output_lines)
 
